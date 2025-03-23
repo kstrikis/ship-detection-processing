@@ -10,11 +10,11 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ship_detection.io.readers import SARDataReader
-from ship_detection.processing.ship_detector import ShipDetector
-from ship_detection.processing.doppler_subaperture import DopplerSubapertureProcessor
-from ship_detection.visualization.heatmaps import VibrationHeatmapVisualizer
-from ship_detection.utils.helpers import setup_logging, save_results
+from src.ship_detection.io.readers import SARDataReader
+from src.ship_detection.processing.ship_detector import ShipDetector
+from src.ship_detection.processing.doppler_subaperture import DopplerSubapertureProcessor
+from src.ship_detection.visualization.heatmaps import VibrationHeatmapVisualizer
+from src.ship_detection.utils.helpers import setup_logging, save_results
 
 logger = logging.getLogger(__name__)
 

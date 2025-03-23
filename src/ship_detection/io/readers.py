@@ -7,13 +7,32 @@ import logging
 from typing import Union, Dict, Tuple, Optional, List, Any
 
 import numpy as np
-from sarpy.io.general.utils import get_filename_extension
+# Remove the import of get_filename_extension as it doesn't exist
+# from sarpy.io.general.utils import get_filename_extension
 from sarpy.io.phase_history.cphd import CPHDReader
 from sarpy.io.complex.sicd import SICDReader
 from sarpy.io.phase_history.converter import open_phase_history
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+# Add a custom implementation of get_filename_extension
+def get_filename_extension(file_path: str) -> str:
+    """
+    Get the filename extension from a file path.
+    
+    Parameters
+    ----------
+    file_path : str
+        The file path.
+        
+    Returns
+    -------
+    str
+        The file extension with a leading dot (e.g., '.cphd').
+    """
+    _, ext = os.path.splitext(file_path)
+    return ext
 
 class SARDataReader:
     """
@@ -102,8 +121,28 @@ class SARDataReader:
         if not isinstance(self.reader, CPHDReader):
             raise TypeError("Reader is not a CPHDReader")
         
-        # Read the signal data for the specified channel
-        return self.reader.read_signal_block()[channel_id]
+        # Read the signal data
+        signal_block = self.reader.read_signal_block()
+        
+        # Log the signal block details
+        logger.info(f"Signal block type: {type(signal_block)}")
+        if isinstance(signal_block, dict):
+            logger.info(f"Signal block keys: {list(signal_block.keys())}")
+        
+        # Handle different return formats from read_signal_block
+        if isinstance(signal_block, dict) and channel_id in signal_block:
+            # Dictionary format with channel_id as key
+            return signal_block[channel_id]
+        elif isinstance(signal_block, dict) and len(signal_block) > 0:
+            # Dictionary format but channel_id not found, return first channel
+            logger.warning(f"Channel ID {channel_id} not found, using first available channel")
+            return list(signal_block.values())[0]
+        elif isinstance(signal_block, np.ndarray):
+            # Direct array format
+            return signal_block
+        else:
+            # Unexpected format
+            raise ValueError(f"Unexpected signal data format: {type(signal_block)}")
     
     def read_pvp_data(self, channel_id: Union[int, str] = 0) -> Dict[str, np.ndarray]:
         """
