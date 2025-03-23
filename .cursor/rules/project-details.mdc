@@ -1,0 +1,6 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+We are using Python 3.12 to manipulate SAR data with sarpy. SarPy is a basic Python library to read, write, and do simple processing of complex SAR data using the NGA SICD format (standards linked below). It has been released by NGA to encourage the use of SAR data standards throughout the international SAR community. SarPy complements the SIX library (C++) and the MATLAB SAR Toolbox, which are implemented in other languages but have similar goals.
