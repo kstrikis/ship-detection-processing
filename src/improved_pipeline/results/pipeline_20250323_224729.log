@@ -1,0 +1,4 @@
+2025-03-23 22:47:29,669 - ship_micromotion - INFO - Logging initialized at level INFO
+2025-03-23 22:47:29,669 - ship_micromotion - INFO - Starting improved micro-motion pipeline. Args: Namespace(input=None, output_dir='results', log_file='results/pipeline_20250323_224729.log', log_level='INFO', run_all=False, run_stage=None, stage_input=None, stage_output=None, use_gpu=False, skip_constraints=False, crop_only=False, num_subapertures=200, speckle_filter_size=5)
+2025-03-23 22:47:29,669 - ship_micromotion - INFO - Running complete pipeline
+2025-03-23 22:47:29,669 - ship_micromotion - INFO - Preprocessing SAR data from None

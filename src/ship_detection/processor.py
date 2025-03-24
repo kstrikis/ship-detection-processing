@@ -12,6 +12,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector
 from scipy import signal, ndimage
+from concurrent.futures import ThreadPoolExecutor
+# Import Dask for pipeline parallelism (optional dependency)
+try:
+    import dask
+    from dask.delayed import delayed
+    DASK_AVAILABLE = True
+except ImportError:
+    DASK_AVAILABLE = False
 
 from src.ship_detection.io.readers import SARDataReader
 from src.ship_detection.processing.ship_detector import ShipDetector
@@ -81,6 +89,93 @@ class SARImagePreprocessor:
         filtered_complex = filtered * np.exp(1j * phase)
         
         return filtered_complex
+    
+    def downsample_image(self, image_data: np.ndarray, factor: int = 4) -> np.ndarray:
+        """
+        Create a downsampled version of the image data for faster initial processing.
+        
+        Parameters
+        ----------
+        image_data : np.ndarray
+            Original image data.
+        factor : int, optional
+            Downsampling factor, by default 4
+            
+        Returns
+        -------
+        np.ndarray
+            Downsampled image.
+        """
+        rows, cols = image_data.shape
+        
+        if factor <= 1:
+            return image_data
+            
+        # Calculate new dimensions
+        new_rows = rows // factor
+        new_cols = cols // factor
+        
+        self.logger.info(f"Downsampling image from {rows}x{cols} to {new_rows}x{new_cols}")
+        
+        # Create downsampled array
+        downsampled = np.zeros((new_rows, new_cols), dtype=image_data.dtype)
+        
+        # Use block averaging for downsampling to preserve energy
+        for i in range(new_rows):
+            for j in range(new_cols):
+                r_start = i * factor
+                r_end = min((i + 1) * factor, rows)
+                c_start = j * factor
+                c_end = min((j + 1) * factor, cols)
+                
+                block = image_data[r_start:r_end, c_start:c_end]
+                downsampled[i, j] = np.mean(block)
+        
+        return downsampled
+    
+    def scale_coordinates(self, 
+                         coords: Tuple[int, int, int, int], 
+                         original_shape: Tuple[int, int], 
+                         downsampled_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+        """
+        Scale coordinates from downsampled image back to original image.
+        
+        Parameters
+        ----------
+        coords : Tuple[int, int, int, int]
+            Coordinates in downsampled image (x1, y1, x2, y2).
+        original_shape : Tuple[int, int]
+            Shape of original image (rows, cols).
+        downsampled_shape : Tuple[int, int]
+            Shape of downsampled image (rows, cols).
+            
+        Returns
+        -------
+        Tuple[int, int, int, int]
+            Scaled coordinates in original image.
+        """
+        orig_rows, orig_cols = original_shape
+        down_rows, down_cols = downsampled_shape
+        
+        x1, y1, x2, y2 = coords
+        
+        # Calculate scaling factors
+        row_scale = orig_rows / down_rows
+        col_scale = orig_cols / down_cols
+        
+        # Scale coordinates
+        x1_orig = int(x1 * col_scale)
+        y1_orig = int(y1 * row_scale)
+        x2_orig = int(x2 * col_scale)
+        y2_orig = int(y2 * row_scale)
+        
+        # Ensure coordinates are within bounds
+        x1_orig = max(0, min(x1_orig, orig_cols - 1))
+        y1_orig = max(0, min(y1_orig, orig_rows - 1))
+        x2_orig = max(0, min(x2_orig, orig_cols - 1))
+        y2_orig = max(0, min(y2_orig, orig_rows - 1))
+        
+        return (x1_orig, y1_orig, x2_orig, y2_orig)
 
 
 class PixelPhaseHistoryExtractor:
@@ -107,7 +202,7 @@ class PixelPhaseHistoryExtractor:
         np.ndarray
             Array of subaperture images.
         """
-        self.logger.info(f"Creating {num_subapertures} subapertures")
+        self.logger.info(f"Creating {num_subapertures} subapertures using parallel processing")
         
         # Get signal dimensions
         rows, cols = signal_data.shape
@@ -119,20 +214,29 @@ class PixelPhaseHistoryExtractor:
         aperture_width = cols // 2  # Use half of the full aperture
         step_size = (cols - aperture_width) // (num_subapertures - 1) if num_subapertures > 1 else 1
         
-        # Generate subapertures
-        for i in range(num_subapertures):
+        # Process subapertures in parallel
+        def process_subaperture(i):
             start_col = i * step_size
             end_col = start_col + aperture_width
             
             if end_col > cols:
-                break
+                return None
                 
             # Extract subaperture
             subaperture = np.zeros((rows, cols), dtype=complex)
             subaperture[:, start_col:end_col] = signal_data[:, start_col:end_col]
             
             # Focus subaperture
-            subapertures[i] = np.fft.fftshift(np.fft.fft2(subaperture))
+            return np.fft.fftshift(np.fft.fft2(subaperture))
+        
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_subaperture, i) for i in range(num_subapertures)]
+            
+            for i, future in enumerate(futures):
+                result = future.result()
+                if result is not None:
+                    subapertures[i] = result
         
         self.subapertures = subapertures
         self.sampling_freq = 1.0  # Normalized frequency, can be adjusted based on PVP data
@@ -188,20 +292,50 @@ class PixelPhaseHistoryExtractor:
         width = x2 - x1 + 1
         height = y2 - y1 + 1
         
-        # Create phase history matrix
-        phase_histories = np.zeros((height, width, len(self.subapertures)))
-        
-        # Extract phase history for each pixel
-        for i in range(height):
-            for j in range(width):
-                row, col = y1 + i, x1 + j
-                phase_histories[i, j, :] = self.extract_pixel_phase_history(row, col)
-        
-        return {
-            'phase_histories': phase_histories,
-            'ship_bbox': ship_region['bbox'],
-            'dimensions': (height, width)
-        }
+        # Try to use GPU acceleration if available
+        try:
+            import cupy as cp
+            self.logger.info("Using GPU acceleration with CuPy for phase history extraction")
+            
+            # Transfer subapertures to GPU
+            gpu_subapertures = cp.asarray(self.subapertures)
+            
+            # Extract region and compute phase histories on GPU
+            region_subapertures = gpu_subapertures[:, y1:y2+1, x1:x2+1]
+            phase_histories = cp.angle(region_subapertures)
+            
+            # Unwrap phase on GPU
+            phase_histories = cp.unwrap(phase_histories, axis=0)
+            
+            # Transfer result back to CPU
+            phase_histories_cpu = cp.asnumpy(phase_histories)
+            
+            # Reshape to match expected format (height, width, time)
+            phase_histories_cpu = np.transpose(phase_histories_cpu, (1, 2, 0))
+            
+            return {
+                'phase_histories': phase_histories_cpu,
+                'ship_bbox': ship_region['bbox'],
+                'dimensions': (height, width)
+            }
+            
+        except (ImportError, ModuleNotFoundError):
+            self.logger.info("CuPy not available, using CPU implementation")
+            
+            # Create phase history matrix
+            phase_histories = np.zeros((height, width, len(self.subapertures)))
+            
+            # Extract phase history for each pixel
+            for i in range(height):
+                for j in range(width):
+                    row, col = y1 + i, x1 + j
+                    phase_histories[i, j, :] = self.extract_pixel_phase_history(row, col)
+            
+            return {
+                'phase_histories': phase_histories,
+                'ship_bbox': ship_region['bbox'],
+                'dimensions': (height, width)
+            }
 
 
 class TimeFrequencyAnalyzer:
@@ -300,36 +434,58 @@ class TimeFrequencyAnalyzer:
         Dict[str, Any]
             Dictionary with analysis results.
         """
-        height, width, _ = phase_histories.shape
+        self.logger.info("Performing vectorized FFT analysis for all pixels")
+        height, width, time_samples = phase_histories.shape
         
-        # Create result containers
+        # Create window function once
+        window = np.hanning(time_samples)
+        
+        # Apply windowing to all pixel phase histories at once
+        # Shape: height x width x time
+        windowed_signals = phase_histories * window[np.newaxis, np.newaxis, :]
+        
+        # Perform FFT on all pixels at once
+        # Shape: height x width x time
+        fft_results = np.abs(np.fft.fft(windowed_signals, axis=2))
+        
+        # Calculate frequency axis once
+        fft_freqs = np.fft.fftfreq(time_samples, 1/sampling_freq)
+        
+        # Get positive frequencies only
+        pos_mask = fft_freqs >= 0
+        pos_freqs = fft_freqs[pos_mask]
+        pos_spectra = fft_results[:, :, pos_mask]
+        
+        # Find dominant frequencies (peaks in spectrum) for each pixel
+        # Skip the DC component (index 0)
+        start_idx = 1
         dominant_freqs = np.zeros((height, width))
         dominant_amps = np.zeros((height, width))
-        all_spectra = np.zeros((height, width, phase_histories.shape[2]//2 + 1))
         
-        # Process each pixel
+        # This is still a loop, but we've reduced complexity by calculating FFTs vectorially
         for i in range(height):
             for j in range(width):
-                phase_history = phase_histories[i, j, :]
-                analysis = self.analyze_single_pixel(phase_history, sampling_freq)
-                
-                # Store dominant frequency (if any)
-                dom_freqs = analysis['dominant_frequencies']['frequencies']
-                dom_amps = analysis['dominant_frequencies']['amplitudes']
-                
-                if len(dom_freqs) > 0:
-                    dominant_freqs[i, j] = dom_freqs[0]
-                    dominant_amps[i, j] = dom_amps[0]
-                
-                # Store full spectrum
-                spectrum_len = min(len(analysis['fft']['spectrum']), all_spectra.shape[2])
-                all_spectra[i, j, :spectrum_len] = analysis['fft']['spectrum'][:spectrum_len]
+                spectrum = pos_spectra[i, j, start_idx:]
+                if len(spectrum) > 0:
+                    # Find peaks above threshold
+                    peaks, _ = signal.find_peaks(spectrum, height=0.1*np.max(spectrum))
+                    
+                    if len(peaks) > 0:
+                        # Adjust indices to account for start_idx offset
+                        peak_indices = peaks + start_idx
+                        peak_freqs = pos_freqs[peak_indices]
+                        peak_amps = pos_spectra[i, j, peak_indices]
+                        
+                        # Find highest amplitude peak
+                        max_idx = np.argmax(peak_amps)
+                        dominant_freqs[i, j] = peak_freqs[max_idx]
+                        dominant_amps[i, j] = peak_amps[max_idx]
         
         return {
             'dominant_frequencies': dominant_freqs,
             'dominant_amplitudes': dominant_amps,
-            'all_spectra': all_spectra,
-            'frequency_axis': analysis['fft']['freqs'][:all_spectra.shape[2]]
+            'all_spectra': pos_spectra,
+            'frequency_axis': pos_freqs
         }
 
 
@@ -362,59 +518,145 @@ class ShipComponentClassifier:
         # Create empty component map
         component_map = np.zeros_like(intensity_mask, dtype=int)
         
-        # Extract features for classification
-        gradient_x = ndimage.sobel(np.abs(ship_region), axis=1)
-        gradient_y = ndimage.sobel(np.abs(ship_region), axis=0)
-        gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
-        
-        # Get ship dimensions
-        rows, cols = ship_region.shape
-        
-        # Define regions (simplified approach)
-        # 1: Hull, 2: Deck, 3: Superstructure, 4: Bow, 5: Stern
-        
-        # Bow and stern (front and back quarters)
-        left_quarter = int(cols * 0.25)
-        right_quarter = int(cols * 0.75)
-        
-        # Check gradient patterns to determine which end is bow
-        left_gradients = np.sum(gradient_magnitude[:, :left_quarter])
-        right_gradients = np.sum(gradient_magnitude[:, right_quarter:])
-        
-        # Initialize different component areas
-        if left_gradients > right_gradients:
-            # Bow is on the left
-            component_map[:, :left_quarter][intensity_mask[:, :left_quarter]] = 4  # Bow
-            component_map[:, right_quarter:][intensity_mask[:, right_quarter:]] = 5  # Stern
-        else:
-            # Bow is on the right
-            component_map[:, right_quarter:][intensity_mask[:, right_quarter:]] = 4  # Bow
-            component_map[:, :left_quarter][intensity_mask[:, :left_quarter]] = 5  # Stern
-        
-        # Central hull area
-        middle_section = intensity_mask.copy()
-        middle_section[:, :left_quarter] = False
-        middle_section[:, right_quarter:] = False
-        
-        # Split into hull (bottom), deck (middle) and superstructure (top)
-        top_third = int(rows * 0.33)
-        bottom_third = int(rows * 0.67)
-        
-        # Hull (bottom part)
-        hull_mask = middle_section.copy()
-        hull_mask[:bottom_third, :] = False
-        component_map[hull_mask] = 1
-        
-        # Deck (middle part)
-        deck_mask = middle_section.copy()
-        deck_mask[:top_third, :] = False
-        deck_mask[bottom_third:, :] = False
-        component_map[deck_mask] = 2
-        
-        # Superstructure (top part)
-        superstructure_mask = middle_section.copy()
-        superstructure_mask[top_third:, :] = False
-        component_map[superstructure_mask] = 3
+        # Try to use GPU acceleration if available
+        try:
+            import cupy as cp
+            self.logger.info("Using GPU acceleration with CuPy for component classification")
+            
+            # Transfer data to GPU
+            gpu_ship_region = cp.asarray(np.abs(ship_region))
+            gpu_intensity_mask = cp.asarray(intensity_mask)
+            
+            # Extract features for classification using GPU
+            gradient_x = cp.zeros_like(gpu_ship_region)
+            gradient_y = cp.zeros_like(gpu_ship_region)
+            
+            # Implement Sobel filter
+            for i in range(1, gpu_ship_region.shape[0] - 1):
+                for j in range(1, gpu_ship_region.shape[1] - 1):
+                    # X gradient
+                    gradient_x[i, j] = (
+                        (gpu_ship_region[i-1, j+1] + 2*gpu_ship_region[i, j+1] + gpu_ship_region[i+1, j+1]) -
+                        (gpu_ship_region[i-1, j-1] + 2*gpu_ship_region[i, j-1] + gpu_ship_region[i+1, j-1])
+                    )
+                    
+                    # Y gradient
+                    gradient_y[i, j] = (
+                        (gpu_ship_region[i+1, j-1] + 2*gpu_ship_region[i+1, j] + gpu_ship_region[i+1, j+1]) -
+                        (gpu_ship_region[i-1, j-1] + 2*gpu_ship_region[i-1, j] + gpu_ship_region[i-1, j+1])
+                    )
+            
+            gradient_magnitude = cp.sqrt(gradient_x**2 + gradient_y**2)
+            
+            # Get ship dimensions
+            rows, cols = gpu_ship_region.shape
+            
+            # Retrieve array from GPU for further processing
+            gradient_magnitude_cpu = cp.asnumpy(gradient_magnitude)
+            intensity_mask_cpu = cp.asnumpy(gpu_intensity_mask)
+            
+            # Define regions (simplified approach)
+            # 1: Hull, 2: Deck, 3: Superstructure, 4: Bow, 5: Stern
+            
+            # Bow and stern (front and back quarters)
+            left_quarter = int(cols * 0.25)
+            right_quarter = int(cols * 0.75)
+            
+            # Check gradient patterns to determine which end is bow
+            left_gradients = np.sum(gradient_magnitude_cpu[:, :left_quarter])
+            right_gradients = np.sum(gradient_magnitude_cpu[:, right_quarter:])
+            
+            # Initialize different component areas
+            if left_gradients > right_gradients:
+                # Bow is on the left
+                component_map[:, :left_quarter][intensity_mask_cpu[:, :left_quarter]] = 4  # Bow
+                component_map[:, right_quarter:][intensity_mask_cpu[:, right_quarter:]] = 5  # Stern
+            else:
+                # Bow is on the right
+                component_map[:, right_quarter:][intensity_mask_cpu[:, right_quarter:]] = 4  # Bow
+                component_map[:, :left_quarter][intensity_mask_cpu[:, :left_quarter]] = 5  # Stern
+            
+            # Central hull area
+            middle_section = intensity_mask_cpu.copy()
+            middle_section[:, :left_quarter] = False
+            middle_section[:, right_quarter:] = False
+            
+            # Split into hull (bottom), deck (middle) and superstructure (top)
+            top_third = int(rows * 0.33)
+            bottom_third = int(rows * 0.67)
+            
+            # Hull (bottom part)
+            hull_mask = middle_section.copy()
+            hull_mask[:bottom_third, :] = False
+            component_map[hull_mask] = 1
+            
+            # Deck (middle part)
+            deck_mask = middle_section.copy()
+            deck_mask[:top_third, :] = False
+            deck_mask[bottom_third:, :] = False
+            component_map[deck_mask] = 2
+            
+            # Superstructure (top part)
+            superstructure_mask = middle_section.copy()
+            superstructure_mask[top_third:, :] = False
+            component_map[superstructure_mask] = 3
+            
+        except (ImportError, ModuleNotFoundError):
+            self.logger.info("CuPy not available, using CPU implementation for component classification")
+            
+            # Extract features for classification
+            gradient_x = ndimage.sobel(np.abs(ship_region), axis=1)
+            gradient_y = ndimage.sobel(np.abs(ship_region), axis=0)
+            gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
+            
+            # Get ship dimensions
+            rows, cols = ship_region.shape
+            
+            # Define regions (simplified approach)
+            # 1: Hull, 2: Deck, 3: Superstructure, 4: Bow, 5: Stern
+            
+            # Bow and stern (front and back quarters)
+            left_quarter = int(cols * 0.25)
+            right_quarter = int(cols * 0.75)
+            
+            # Check gradient patterns to determine which end is bow
+            left_gradients = np.sum(gradient_magnitude[:, :left_quarter])
+            right_gradients = np.sum(gradient_magnitude[:, right_quarter:])
+            
+            # Initialize different component areas
+            if left_gradients > right_gradients:
+                # Bow is on the left
+                component_map[:, :left_quarter][intensity_mask[:, :left_quarter]] = 4  # Bow
+                component_map[:, right_quarter:][intensity_mask[:, right_quarter:]] = 5  # Stern
+            else:
+                # Bow is on the right
+                component_map[:, right_quarter:][intensity_mask[:, right_quarter:]] = 4  # Bow
+                component_map[:, :left_quarter][intensity_mask[:, :left_quarter]] = 5  # Stern
+            
+            # Central hull area
+            middle_section = intensity_mask.copy()
+            middle_section[:, :left_quarter] = False
+            middle_section[:, right_quarter:] = False
+            
+            # Split into hull (bottom), deck (middle) and superstructure (top)
+            top_third = int(rows * 0.33)
+            bottom_third = int(rows * 0.67)
+            
+            # Hull (bottom part)
+            hull_mask = middle_section.copy()
+            hull_mask[:bottom_third, :] = False
+            component_map[hull_mask] = 1
+            
+            # Deck (middle part)
+            deck_mask = middle_section.copy()
+            deck_mask[:top_third, :] = False
+            deck_mask[bottom_third:, :] = False
+            component_map[deck_mask] = 2
+            
+            # Superstructure (top part)
+            superstructure_mask = middle_section.copy()
+            superstructure_mask[top_third:, :] = False
+            component_map[superstructure_mask] = 3
         
         return component_map
 
@@ -687,7 +929,12 @@ class EnhancedShipDetectionProcessor:
     def __init__(self, 
                 input_file: str, 
                 output_dir: str = "results",
-                log_file: Optional[str] = None):
+                log_file: Optional[str] = None,
+                use_gpu: bool = True,
+                use_parallel: bool = True,
+                use_pipeline: bool = True,
+                tile_processing: bool = False,
+                tile_size: int = 512):
         """
         Initialize the processor.
         
@@ -699,6 +946,16 @@ class EnhancedShipDetectionProcessor:
             Directory to save results, by default "results"
         log_file : Optional[str], optional
             Path to log file, by default None
+        use_gpu : bool, optional
+            Whether to use GPU acceleration if available, by default True
+        use_parallel : bool, optional
+            Whether to use parallel processing, by default True
+        use_pipeline : bool, optional
+            Whether to use pipeline parallelism with Dask, by default True
+        tile_processing : bool, optional
+            Whether to use tile-based processing for large datasets, by default False
+        tile_size : int, optional
+            Size of tiles for tile-based processing, by default 512
         """
         # Setup logging
         self.logger = setup_logging(log_file)
@@ -710,6 +967,27 @@ class EnhancedShipDetectionProcessor:
         # Create output directory if it doesn't exist
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+        
+        # Parallelization parameters
+        self.use_gpu = use_gpu
+        self.use_parallel = use_parallel
+        self.use_pipeline = use_pipeline and DASK_AVAILABLE
+        self.tile_processing = tile_processing
+        self.tile_size = tile_size
+        
+        # Check for GPU availability
+        if self.use_gpu:
+            try:
+                import cupy
+                self.logger.info("GPU acceleration is available")
+            except ImportError:
+                self.logger.info("CuPy not found, GPU acceleration disabled")
+                self.use_gpu = False
+        
+        # Check for Dask availability
+        if self.use_pipeline and not DASK_AVAILABLE:
+            self.logger.info("Dask not found, pipeline parallelism disabled")
+            self.use_pipeline = False
         
         # Initialize components
         self.reader = None
@@ -729,6 +1007,36 @@ class EnhancedShipDetectionProcessor:
         self.component_results = None
         self.physics_results = None
         self.visualization_results = None
+        
+        # Processing parameters
+        self.num_subapertures = 200  # Default number of subapertures
+        self.speckle_filter_size = 5  # Default speckle filter kernel size
+        self.skip_constraints = False  # Whether to skip physical constraints
+        self.use_manual_selection = False  # Whether to use manual ship selection
+        self.crop_only = False  # Whether to only perform cropping
+        self.component_analysis = True  # Whether to perform component-specific analysis
+        self.apply_normalization = True  # Whether to apply image normalization
+        self.preview_downsample_factor = 4  # Default downsampling factor for preview
+        
+        # Log memory usage
+        self._log_memory_usage("initialization")
+    
+    def _log_memory_usage(self, stage_name: str) -> None:
+        """
+        Log current memory usage.
+        
+        Parameters
+        ----------
+        stage_name : str
+            Name of the current processing stage.
+        """
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            memory_usage_gb = process.memory_info().rss / (1024 * 1024 * 1024)
+            self.logger.info(f"Memory usage after {stage_name}: {memory_usage_gb:.2f} GB")
+        except ImportError:
+            self.logger.debug("psutil not installed, skipping memory usage tracking")
     
     def read_data(self) -> Dict[str, Any]:
         """
@@ -746,6 +1054,16 @@ class EnhancedShipDetectionProcessor:
             self.logger.info("Detected cropped NPY file, loading directly...")
             try:
                 self.read_results = self.load_cropped_cphd(self.input_file)
+                
+                # Create downsampled preview for ship detection
+                if 'focused_image' in self.read_results:
+                    orig_image = self.read_results['focused_image']
+                    self.read_results['preview_image'] = self.preprocessor.downsample_image(
+                        orig_image, self.preview_downsample_factor)
+                    self.read_results['preview_factor'] = self.preview_downsample_factor
+                    self.read_results['original_shape'] = orig_image.shape
+                    self.read_results['preview_shape'] = self.read_results['preview_image'].shape
+                
                 return self.read_results
             except Exception as e:
                 self.logger.error(f"Error loading cropped data: {str(e)}")
@@ -769,13 +1087,27 @@ class EnhancedShipDetectionProcessor:
             # (This is a simplified approach, real focusing would be more complex)
             focused_image = np.fft.fftshift(np.fft.fft2(signal_data))
             
+            # Create downsampled preview for ship detection
+            preview_image = self.preprocessor.downsample_image(
+                focused_image, self.preview_downsample_factor)
+            
             self.read_results = {
                 'type': 'cphd',
                 'metadata': self.reader.get_metadata(),
                 'signal_data': signal_data,
                 'pvp_data': pvp_data,
-                'focused_image': focused_image
+                'focused_image': focused_image,
+                'preview_image': preview_image,
+                'preview_factor': self.preview_downsample_factor,
+                'original_shape': focused_image.shape,
+                'preview_shape': preview_image.shape
             }
+            
+            # Memory usage info for monitoring
+            full_size_mb = focused_image.nbytes / (1024 * 1024)
+            preview_size_mb = preview_image.nbytes / (1024 * 1024)
+            self.logger.info(f"Full image size: {full_size_mb:.2f} MB, Preview size: {preview_size_mb:.2f} MB")
+            self.logger.info(f"Memory reduction: {100 * (1 - preview_size_mb/full_size_mb):.1f}%")
             
             return self.read_results
             
@@ -786,11 +1118,25 @@ class EnhancedShipDetectionProcessor:
             # Read complex image data
             image_data = self.reader.read_sicd_data()
             
+            # Create downsampled preview for ship detection
+            preview_image = self.preprocessor.downsample_image(
+                image_data, self.preview_downsample_factor)
+            
             self.read_results = {
                 'type': 'sicd',
                 'metadata': self.reader.get_metadata(),
-                'image_data': image_data
+                'image_data': image_data,
+                'preview_image': preview_image,
+                'preview_factor': self.preview_downsample_factor,
+                'original_shape': image_data.shape,
+                'preview_shape': preview_image.shape
             }
+            
+            # Memory usage info for monitoring
+            full_size_mb = image_data.nbytes / (1024 * 1024)
+            preview_size_mb = preview_image.nbytes / (1024 * 1024)
+            self.logger.info(f"Full image size: {full_size_mb:.2f} MB, Preview size: {preview_size_mb:.2f} MB")
+            self.logger.info(f"Memory reduction: {100 * (1 - preview_size_mb/full_size_mb):.1f}%")
             
             return self.read_results
             
@@ -804,54 +1150,123 @@ class EnhancedShipDetectionProcessor:
             
             return self.read_results
     
-    def detect_ships(self, image_data: np.ndarray) -> Dict[str, Any]:
+    def detect_ships(self, image_data: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
-        Detect ships in the image.
+        Detect ships in the image using downsampled preview for efficiency.
         
         Parameters
         ----------
-        image_data : np.ndarray
-            Image data.
+        image_data : Optional[np.ndarray], optional
+            Custom image data to use, by default None (uses preview image)
             
         Returns
         -------
         Dict[str, Any]
             Dictionary containing detection results.
         """
-        self.logger.info("Detecting ships...")
+        self.logger.info("Detecting ships using low-resolution preview...")
         
-        # Apply speckle filter for better detection
-        filtered_image = self.preprocessor.apply_speckle_filter(image_data)
+        if image_data is None and 'preview_image' in self.read_results:
+            # Use the downsampled preview image by default
+            image_data = self.read_results['preview_image']
+            self.logger.info(f"Using preview image with shape {image_data.shape}")
+        elif image_data is None and 'focused_image' in self.read_results:
+            # Fallback to full resolution if preview not available
+            image_data = self.read_results['focused_image']
+            self.logger.warning("Preview image not found, using full resolution")
+        elif image_data is None and 'image_data' in self.read_results:
+            # Fallback for SICD
+            image_data = self.read_results['image_data']
+            self.logger.warning("Preview image not found, using full resolution")
+        
+        # Apply speckle filter for better detection if enabled
+        if self.speckle_filter_size > 0:
+            start_time = datetime.datetime.now()
+            filtered_image = self.preprocessor.apply_speckle_filter(
+                image_data, self.speckle_filter_size)
+            end_time = datetime.datetime.now()
+            elapsed = (end_time - start_time).total_seconds()
+            self.logger.info(f"Applied speckle filter with kernel size {self.speckle_filter_size} in {elapsed:.2f} seconds")
+        else:
+            filtered_image = image_data
+            self.logger.info("Speckle filtering disabled")
         
         # Initialize ship detector
+        start_time = datetime.datetime.now()
+        self.logger.info("Initializing ship detector...")
         self.ship_detector = ShipDetector(filtered_image)
         
         # Run detection pipeline
+        self.logger.info("Running ship detection pipeline...")
         detection_results = self.ship_detector.process_all()
+        end_time = datetime.datetime.now()
+        elapsed = (end_time - start_time).total_seconds()
         
+        # Count detected ships
         num_ships = len(detection_results['filtered_ships'])
-        self.logger.info(f"Detected {num_ships} ships")
+        self.logger.info(f"Detected {num_ships} ships in {elapsed:.2f} seconds")
+        
+        # If we're using a preview image, we need to scale coordinates back to original
+        if 'preview_factor' in self.read_results and self.read_results['preview_factor'] > 1:
+            self.logger.info("Scaling detection coordinates to original resolution...")
+            orig_shape = self.read_results['original_shape']
+            preview_shape = self.read_results['preview_shape']
+            
+            # Scale ship regions
+            for region in detection_results['filtered_ships']:
+                x1, y1, x2, y2 = region['bbox']
+                
+                # Scale back to original coordinates
+                x1_orig, y1_orig, x2_orig, y2_orig = self.preprocessor.scale_coordinates(
+                    (x1, y1, x2, y2), orig_shape, preview_shape)
+                
+                # Update bounding box
+                region['bbox'] = (x1_orig, y1_orig, x2_orig, y2_orig)
+                region['width'] = x2_orig - x1_orig + 1
+                region['height'] = y2_orig - y1_orig + 1
+                region['area'] = region['width'] * region['height']
+                region['center'] = ((x1_orig + x2_orig) // 2, (y1_orig + y2_orig) // 2)
+                region['centroid'] = ((y1_orig + y2_orig) // 2, (x1_orig + x2_orig) // 2)
+                
+                # We can't update the region or mask here, they'll be extracted from the original later
+                # Don't delete them as they're needed for some internal processing
         
         # Store results
         self.detection_results = detection_results
         
         return detection_results
     
-    def manually_select_ships(self, image_data: np.ndarray) -> Dict[str, Any]:
+    def manually_select_ships(self, image_data: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
-        Allow manual selection of ships in the image.
+        Allow manual selection of ships in the image using downsampled preview.
         
         Parameters
         ----------
-        image_data : np.ndarray
-            Image data.
+        image_data : Optional[np.ndarray], optional
+            Custom image data to use, by default None (uses preview image)
             
         Returns
         -------
         Dict[str, Any]
             Dictionary containing ship regions.
         """
-        self.logger.info("Starting manual ship selection...")
+        self.logger.info("Starting manual ship selection using low-resolution preview...")
+        
+        # Use the downsampled preview image for display and selection
+        if image_data is None and 'preview_image' in self.read_results:
+            image_data = self.read_results['preview_image']
+            using_preview = True
+            self.logger.info(f"Using preview image with shape {image_data.shape}")
+        elif image_data is None and 'focused_image' in self.read_results:
+            image_data = self.read_results['focused_image']
+            using_preview = False
+            self.logger.warning("Preview image not found, using full resolution")
+        elif image_data is None and 'image_data' in self.read_results:
+            image_data = self.read_results['image_data']
+            using_preview = False
+            self.logger.warning("Preview image not found, using full resolution")
+        else:
+            using_preview = False
         
         # Scale image data for better visualization
         display_data = self.preprocessor.scale_for_display(image_data)
@@ -877,23 +1292,9 @@ class EnhancedShipDetectionProcessor:
             if y1 > y2:
                 y1, y2 = y2, y1
             
-            # Extract region
-            region = image_data[y1:y2+1, x1:x2+1]
-            
-            # Create mask
-            mask = np.ones((y2-y1+1, x2-x1+1), dtype=bool)
-            
-            # Calculate center
-            center_y = (y1 + y2) // 2
-            center_x = (x1 + x2) // 2
-            
-            # Add region
+            # Add region with preview coordinates
             region_data = {
                 'bbox': (x1, y1, x2, y2),
-                'center': (center_x, center_y),
-                'centroid': (center_y, center_x),  # Add centroid key (row, col format for visualization)
-                'region': region,
-                'mask': mask,
                 'width': x2 - x1 + 1,
                 'height': y2 - y1 + 1,
                 'area': (x2 - x1 + 1) * (y2 - y1 + 1)
@@ -920,8 +1321,13 @@ class EnhancedShipDetectionProcessor:
         plt.colorbar(label='Normalized Amplitude (dB)')
         
         # Add instructions text
+        if using_preview:
+            info_text = f'Using downsampled preview ({self.read_results["preview_factor"]}x) for efficiency. '
+        else:
+            info_text = 'Using full resolution image. '
+            
         plt.figtext(0.5, 0.01, 
-                    'Click and drag to select ships. Press Enter when done.', 
+                    info_text + 'Click and drag to select ships. Press Enter when done.', 
                     ha='center', fontsize=12, bbox=dict(boxstyle='round', fc='white', alpha=0.8))
         
         # Create RectangleSelector
@@ -949,6 +1355,71 @@ class EnhancedShipDetectionProcessor:
         plt.show()
         
         self.logger.info(f"Manual selection complete. {len(selected_regions)} ships selected.")
+        
+        # If using preview, scale coordinates back to original
+        if using_preview and self.read_results['preview_factor'] > 1:
+            self.logger.info("Scaling selection coordinates to original resolution...")
+            orig_shape = self.read_results['original_shape']
+            preview_shape = self.read_results['preview_shape']
+            
+            # Get the full resolution image data
+            if 'focused_image' in self.read_results:
+                full_image = self.read_results['focused_image']
+            else:
+                full_image = self.read_results['image_data']
+            
+            # Scale and extract from original for each region
+            original_regions = []
+            for region in selected_regions:
+                x1, y1, x2, y2 = region['bbox']
+                
+                # Scale back to original coordinates
+                x1_orig, y1_orig, x2_orig, y2_orig = self.preprocessor.scale_coordinates(
+                    (x1, y1, x2, y2), orig_shape, preview_shape)
+                
+                # Extract region from full resolution image
+                orig_region = full_image[y1_orig:y2_orig+1, x1_orig:x2_orig+1]
+                
+                # Create mask
+                mask = np.ones((y2_orig-y1_orig+1, x2_orig-x1_orig+1), dtype=bool)
+                
+                # Calculate center
+                center_y = (y1_orig + y2_orig) // 2
+                center_x = (x1_orig + x2_orig) // 2
+                
+                # Add to original regions
+                orig_region_data = {
+                    'bbox': (x1_orig, y1_orig, x2_orig, y2_orig),
+                    'center': (center_x, center_y),
+                    'centroid': (center_y, center_x),
+                    'region': orig_region,
+                    'mask': mask,
+                    'width': x2_orig - x1_orig + 1,
+                    'height': y2_orig - y1_orig + 1,
+                    'area': (x2_orig - x1_orig + 1) * (y2_orig - y1_orig + 1)
+                }
+                
+                original_regions.append(orig_region_data)
+            
+            selected_regions = original_regions
+                
+        else:
+            # Extract regions from full image if not using preview
+            for region in selected_regions:
+                x1, y1, x2, y2 = region['bbox']
+                
+                # Extract region
+                region['region'] = image_data[y1:y2+1, x1:x2+1]
+                
+                # Create mask
+                region['mask'] = np.ones((y2-y1+1, x2-y1+1), dtype=bool)
+                
+                # Calculate center
+                center_y = (y1 + y2) // 2
+                center_x = (x1 + x2) // 2
+                
+                region['center'] = (center_x, center_y)
+                region['centroid'] = (center_y, center_x)
         
         # Format results similar to automatic detection
         self.detection_results = {
@@ -1297,7 +1768,7 @@ class EnhancedShipDetectionProcessor:
         signal_data: np.ndarray, 
         pvp_data: Dict[str, np.ndarray],
         ship_regions: List[Dict[str, Any]],
-        num_subapertures: int = 200
+        num_subapertures: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Analyze ship micro-motion using pixel-specific phase history.
@@ -1310,14 +1781,18 @@ class EnhancedShipDetectionProcessor:
             PVP data.
         ship_regions : List[Dict[str, Any]]
             List of detected ship regions.
-        num_subapertures : int, optional
-            Number of subapertures to use, by default 200
+        num_subapertures : Optional[int], optional
+            Number of subapertures to use, by default None (uses self.num_subapertures)
             
         Returns
         -------
         Dict[str, Any]
             Dictionary of micro-motion analysis results.
         """
+        # Use instance parameter if not explicitly provided
+        if num_subapertures is None:
+            num_subapertures = self.num_subapertures
+            
         self.logger.info(f"Analyzing ship micro-motion with {num_subapertures} subapertures...")
         
         # Create subapertures from signal data
@@ -1350,20 +1825,31 @@ class EnhancedShipDetectionProcessor:
             x1, y1, x2, y2 = ship['bbox']
             ship_image = subapertures[0, y1:y2+1, x1:x2+1]  # Use first subaperture
             
-            # Classify ship components
-            component_map = self.component_classifier.classify_components(
-                ship_image, ship['mask'])
+            # Classify ship components if component analysis is enabled
+            if self.component_analysis:
+                component_map = self.component_classifier.classify_components(
+                    ship_image, ship['mask'])
+                self.logger.info("Performed component classification")
+            else:
+                # Create a simple component map with all pixels as one component
+                component_map = np.ones_like(ship['mask'], dtype=int)
+                self.logger.info("Component analysis disabled, using uniform component map")
             
             # Analyze phase histories
             vibration_analysis = self.time_freq_analyzer.analyze_ship_region(
                 ship_phase_data['phase_histories'], sampling_freq)
             
-            # Apply physical constraints
-            constrained_freqs, constrained_amps = self.physics_analyzer.apply_physical_constraints(
-                component_map,
-                vibration_analysis['dominant_frequencies'],
-                vibration_analysis['dominant_amplitudes']
-            )
+            # Apply physical constraints if not disabled
+            if not self.skip_constraints:
+                constrained_freqs, constrained_amps = self.physics_analyzer.apply_physical_constraints(
+                    component_map,
+                    vibration_analysis['dominant_frequencies'],
+                    vibration_analysis['dominant_amplitudes']
+                )
+            else:
+                self.logger.info("Skipping physical constraints as requested")
+                constrained_freqs = vibration_analysis['dominant_frequencies']
+                constrained_amps = vibration_analysis['dominant_amplitudes']
             
             # Collect results for this ship
             ship_result = {
@@ -1385,7 +1871,9 @@ class EnhancedShipDetectionProcessor:
             'ship_results': ship_results,
             'sampling_freq': sampling_freq,
             'num_subapertures': num_subapertures,
-            'subaperture_timestamps': np.arange(num_subapertures) / sampling_freq
+            'subaperture_timestamps': np.arange(num_subapertures) / sampling_freq,
+            'physical_constraints_applied': not self.skip_constraints,
+            'component_analysis_enabled': self.component_analysis
         }
         
         self.vibration_results = results
@@ -1415,13 +1903,22 @@ class EnhancedShipDetectionProcessor:
             image_data = self.read_results['focused_image']
         else:
             image_data = self.read_results['image_data']
+        
+        # Apply normalization if enabled
+        if self.apply_normalization:
+            display_data = self.preprocessor.scale_for_display(image_data)
+            self.logger.info("Applied normalization for visualization")
+        else:
+            # Just use absolute value for display
+            display_data = np.abs(image_data)
+            display_data = display_data / np.max(display_data)
+            self.logger.info("Using simple absolute value for visualization")
             
         # Create ship detection overview
         try:
             fig, ax = plt.subplots(figsize=(12, 10))
             
             # Display the image
-            display_data = self.preprocessor.scale_for_display(image_data)
             ax.imshow(display_data, cmap='gray')
             
             # Overlay ships
@@ -1449,51 +1946,65 @@ class EnhancedShipDetectionProcessor:
                 x1, y1, x2, y2 = ship_result['bbox']
                 ship_image = image_data[y1:y2+1, x1:x2+1]
                 
-                # Create component classification visualization
-                component_fig = self.visualizer.create_component_overlay(
-                    ship_image, ship_result['component_map']
-                )
-                figures[f'ship_{ship_index}_components'] = component_fig
+                # Create component classification visualization if component analysis is enabled
+                if self.component_analysis:
+                    component_fig = self.visualizer.create_component_overlay(
+                        ship_image, ship_result['component_map']
+                    )
+                    figures[f'ship_{ship_index}_components'] = component_fig
                 
                 # Create micromotion heatmap
                 heatmap_fig = self.visualizer.create_micromotion_heatmap(
                     ship_image,
                     ship_result['constrained_frequencies'],
                     ship_result['constrained_amplitudes'],
-                    ship_result['component_map']
+                    ship_result['component_map'] if self.component_analysis else None
                 )
                 figures[f'ship_{ship_index}_micromotion'] = heatmap_fig
                 
                 # Create vibration spectrograms for selected points
-                # Choose central points from each component
-                component_ids = np.unique(ship_result['component_map'])
-                
-                for comp_id in component_ids:
-                    if comp_id == 0:  # Skip background
-                        continue
-                        
-                    # Find central point of this component
-                    comp_mask = ship_result['component_map'] == comp_id
-                    if not np.any(comp_mask):
-                        continue
-                        
-                    # Calculate centroid
-                    coords = np.where(comp_mask)
-                    center_y = int(np.mean(coords[0]))
-                    center_x = int(np.mean(coords[1]))
+                # If component analysis is enabled, create spectrograms for each component
+                if self.component_analysis:
+                    # Choose central points from each component
+                    component_ids = np.unique(ship_result['component_map'])
                     
-                    # Get phase history for this point
+                    for comp_id in component_ids:
+                        if comp_id == 0:  # Skip background
+                            continue
+                            
+                        # Find central point of this component
+                        comp_mask = ship_result['component_map'] == comp_id
+                        if not np.any(comp_mask):
+                            continue
+                            
+                        # Calculate centroid
+                        coords = np.where(comp_mask)
+                        center_y = int(np.mean(coords[0]))
+                        center_x = int(np.mean(coords[1]))
+                        
+                        # Get phase history for this point
+                        phase_history = ship_result['phase_histories']['phase_histories'][center_y, center_x, :]
+                        
+                        # Create spectrogram
+                        spec_fig = self.visualizer.create_vibration_spectrogram(
+                            phase_history, ship_result['sampling_freq']
+                        )
+                        
+                        comp_name = {1: 'hull', 2: 'deck', 3: 'superstructure', 
+                                  4: 'bow', 5: 'stern'}.get(comp_id, f'comp_{comp_id}')
+                        
+                        figures[f'ship_{ship_index}_{comp_name}_spectrogram'] = spec_fig
+                else:
+                    # Create a single spectrogram for the center of the ship
+                    height, width = ship_result['phase_histories']['dimensions']
+                    center_y, center_x = height // 2, width // 2
                     phase_history = ship_result['phase_histories']['phase_histories'][center_y, center_x, :]
                     
-                    # Create spectrogram
                     spec_fig = self.visualizer.create_vibration_spectrogram(
                         phase_history, ship_result['sampling_freq']
                     )
                     
-                    comp_name = {1: 'hull', 2: 'deck', 3: 'superstructure', 
-                               4: 'bow', 5: 'stern'}.get(comp_id, f'comp_{comp_id}')
-                    
-                    figures[f'ship_{ship_index}_{comp_name}_spectrogram'] = spec_fig
+                    figures[f'ship_{ship_index}_spectrogram'] = spec_fig
                 
             except Exception as e:
                 self.logger.error(f"Error creating visualizations for ship {ship_index}: {str(e)}")
@@ -1593,8 +2104,22 @@ class EnhancedShipDetectionProcessor:
         """
         self.logger.info("Starting enhanced processing pipeline...")
         
+        # Choose the appropriate processing method based on configuration
+        if self.tile_processing:
+            self.logger.info("Using tile-based processing for large datasets")
+            return self.process_large_dataset(tile_size=self.tile_size)
+        elif self.use_pipeline:
+            self.logger.info("Using pipeline parallelism with Dask")
+            return self.pipeline_process()
+        
+        # If we're here, we're using regular processing with potential 
+        # thread/GPU acceleration within individual processing steps
+        
         # Read data
         self.read_data()
+        
+        # Memory usage info for monitoring
+        self._log_memory_usage("loading data")
         
         # If the file is not already a cropped file, ask if we should load one
         if not (self.input_file.endswith('.npy') and '_cropped_' in self.input_file):
@@ -1604,6 +2129,16 @@ class EnhancedShipDetectionProcessor:
                 cropped_file = input("Enter the path to the cropped file: ")
                 try:
                     self.read_results = self.load_cropped_cphd(cropped_file)
+                    
+                    # Create preview if it doesn't exist
+                    if 'preview_image' not in self.read_results and 'focused_image' in self.read_results:
+                        orig_image = self.read_results['focused_image']
+                        self.read_results['preview_image'] = self.preprocessor.downsample_image(
+                            orig_image, self.preview_downsample_factor)
+                        self.read_results['preview_factor'] = self.preview_downsample_factor
+                        self.read_results['original_shape'] = orig_image.shape
+                        self.read_results['preview_shape'] = self.read_results['preview_image'].shape
+                        
                 except Exception as e:
                     self.logger.error(f"Failed to load cropped file: {str(e)}")
                     print(f"Failed to load cropped file: {str(e)}")
@@ -1619,6 +2154,26 @@ class EnhancedShipDetectionProcessor:
             signal_data = self.read_results['signal_data']
             pvp_data = self.read_results['pvp_data']
             metadata = self.read_results['metadata']
+            
+            # Check if we're only cropping
+            if self.crop_only:
+                self.logger.info("Crop-only mode activated, skipping detection and analysis")
+                cropped_file = self.crop_and_save_cphd(
+                    focused_image, signal_data, pvp_data, metadata
+                )
+                if cropped_file:
+                    self.logger.info(f"Cropped data saved to {cropped_file}")
+                    print(f"Cropped data saved to {cropped_file}. Use this file for further processing.")
+                    return {
+                        'status': 'success',
+                        'message': 'CPHD data cropped and saved',
+                        'cropped_file': cropped_file
+                    }
+                else:
+                    return {
+                        'status': 'error',
+                        'message': 'Cropping cancelled or failed'
+                    }
             
             # Ask if the user wants to crop the data first
             crop_first = input("Do you want to crop the CPHD data first? (y/n): ").lower().strip() == 'y'
@@ -1636,72 +2191,107 @@ class EnhancedShipDetectionProcessor:
                         'cropped_file': cropped_file
                     }
             
-            # Ask user whether to use automatic or manual detection
-            use_manual = input("Use manual ship selection? (y/n): ").lower().strip() == 'y'
-            
-            # Detect ships (either automatically or manually)
-            if use_manual:
-                self.manually_select_ships(focused_image)
-            else:
-                self.detect_ships(focused_image)
-            
-            # Analyze micro-motion
-            self.analyze_ship_micromotion(
-                signal_data, 
-                pvp_data, 
-                self.detection_results['filtered_ships']
-            )
-            
-            # Create visualizations
-            self.create_visualizations()
-            
-            # Save results
-            saved_files = self.save_results()
+            # Detect ships using the preview image (either automatically or manually)
+            try:
+                if self.use_manual_selection:
+                    self.logger.info("Using manual ship selection as requested")
+                    self.manually_select_ships()  # Uses preview by default
+                else:
+                    self.detect_ships()  # Uses preview by default
+                
+                # Log memory usage after detection
+                self._log_memory_usage("ship detection")
+                
+                # Extract full resolution regions for detected ships
+                if 'preview_factor' in self.read_results and self.read_results['preview_factor'] > 1:
+                    self.logger.info("Extracting full resolution regions for detected ships...")
+                    
+                    # For each ship, extract the region from the full resolution image
+                    for ship in self.detection_results['filtered_ships']:
+                        if 'region' not in ship:  # Skip if region already extracted
+                            x1, y1, x2, y2 = ship['bbox']
+                            ship['region'] = focused_image[y1:y2+1, x1:x2+1]
+                            
+                            # Create or update mask if needed
+                            if 'mask' not in ship or ship['mask'].shape != (y2-y1+1, x2-x1+1):
+                                ship['mask'] = np.ones((y2-y1+1, x2-x1+1), dtype=bool)
+                
+                # Analyze micro-motion
+                self.analyze_ship_micromotion(
+                    signal_data, 
+                    pvp_data, 
+                    self.detection_results['filtered_ships'],
+                    self.num_subapertures
+                )
+                
+                # Log memory usage after micromotion analysis
+                self._log_memory_usage("micromotion analysis")
+                
+                # Create visualizations
+                self.create_visualizations()
+                
+                # Save results
+                saved_files = self.save_results()
+                
+            except MemoryError as e:
+                self.logger.error(f"Memory error during processing: {str(e)}")
+                print(f"Memory error during processing. Try using a smaller preview or crop the data first.")
+                return {
+                    'status': 'error',
+                    'message': f'Memory error: {str(e)}'
+                }
             
         elif self.read_results['type'] == 'sicd':
             # For SICD data, we can only detect ships since we need raw signal data for vibration analysis
             image_data = self.read_results['image_data']
             
-            # Ask user whether to use automatic or manual detection
-            use_manual = input("Use manual ship selection? (y/n): ").lower().strip() == 'y'
-            
-            # Detect ships (either automatically or manually)
-            if use_manual:
-                self.manually_select_ships(image_data)
-            else:
-                self.detect_ships(image_data)
-            
-            # Skip vibration analysis
-            self.logger.warning("Skipping micro-motion analysis - requires CPHD data")
-            
-            # Create limited visualizations (only ship detection)
-            figures = {}
-            
-            # Display the image
-            display_data = self.preprocessor.scale_for_display(image_data)
-            
-            # Create ship detection overview
-            fig, ax = plt.subplots(figsize=(12, 10))
-            ax.imshow(display_data, cmap='gray')
-            
-            # Overlay ships
-            ship_regions = self.detection_results['filtered_ships']
-            for i, ship in enumerate(ship_regions):
-                x1, y1, x2, y2 = ship['bbox']
-                rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
-                                    fill=False, edgecolor='red', linewidth=2)
-                ax.add_patch(rect)
-                ax.text(x1, y1-5, f"Ship {i+1}", 
-                        color='red', fontsize=10, backgroundcolor='white')
+            try:
+                # Detect ships using the preview image (either automatically or manually)
+                if self.use_manual_selection:
+                    self.logger.info("Using manual ship selection as requested")
+                    self.manually_select_ships()  # Uses preview by default
+                else:
+                    self.detect_ships()  # Uses preview by default
                 
-            ax.set_title(f"Detected Ships ({len(ship_regions)})")
-            
-            figures['ship_detection'] = fig
-            
-            self.visualization_results = figures
-            
-            # Save results
-            saved_files = self.save_results()
+                # Skip vibration analysis
+                self.logger.warning("Skipping micro-motion analysis - requires CPHD data")
+                
+                # Create limited visualizations (only ship detection)
+                figures = {}
+                
+                # Display the image
+                display_data = self.preprocessor.scale_for_display(image_data)
+                
+                # Create ship detection overview
+                fig, ax = plt.subplots(figsize=(12, 10))
+                ax.imshow(display_data, cmap='gray')
+                
+                # Overlay ships
+                ship_regions = self.detection_results['filtered_ships']
+                for i, ship in enumerate(ship_regions):
+                    x1, y1, x2, y2 = ship['bbox']
+                    rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                        fill=False, edgecolor='red', linewidth=2)
+                    ax.add_patch(rect)
+                    ax.text(x1, y1-5, f"Ship {i+1}", 
+                            color='red', fontsize=10, backgroundcolor='white')
+                    
+                ax.set_title(f"Detected Ships ({len(ship_regions)})")
+                
+                figures['ship_detection'] = fig
+                
+                self.visualization_results = figures
+                
+                # Save results
+                saved_files = self.save_results()
+                
+            except MemoryError as e:
+                self.logger.error(f"Memory error during processing: {str(e)}")
+                print(f"Memory error during processing. Try using a smaller preview or crop the data first.")
+                return {
+                    'status': 'error',
+                    'message': f'Memory error: {str(e)}'
+                }
             
         else:
             self.logger.error("Unsupported data type for processing")
@@ -1715,6 +2305,435 @@ class EnhancedShipDetectionProcessor:
             self.reader.close()
         
         self.logger.info("Enhanced processing complete")
+        
+        return {
+            'status': 'success',
+            'read_results': self.read_results,
+            'detection_results': self.detection_results,
+            'vibration_results': self.vibration_results,
+            'visualization_results': self.visualization_results,
+            'saved_files': saved_files
+        }
+
+    def process_large_dataset(self, tile_size: int = 512, overlap: int = 64) -> Dict[str, Any]:
+        """
+        Process large SAR datasets using tile-based processing to minimize memory usage.
+        This method divides the image into overlapping tiles, processes each tile separately,
+        and then combines the results.
+        
+        Parameters
+        ----------
+        tile_size : int, optional
+            Size of each processing tile, by default 512
+        overlap : int, optional
+            Overlap between adjacent tiles to avoid edge artifacts, by default 64
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing processing results.
+        """
+        self.logger.info(f"Starting tile-based processing with tile size {tile_size}x{tile_size} and overlap {overlap}")
+        
+        # Check if data is loaded
+        if not self.read_results:
+            self.read_data()
+        
+        # Get the image data
+        if self.read_results['type'] == 'cphd':
+            full_image = self.read_results['focused_image']
+            signal_data = self.read_results['signal_data']
+            pvp_data = self.read_results['pvp_data']
+        elif self.read_results['type'] == 'sicd':
+            full_image = self.read_results['image_data']
+            signal_data = None
+            pvp_data = None
+        else:
+            self.logger.error("Unsupported data type for tile-based processing")
+            return {'status': 'error', 'message': 'Unsupported data type'}
+        
+        # Get image dimensions
+        img_height, img_width = full_image.shape
+        
+        # Calculate number of tiles
+        n_tiles_h = max(1, (img_height - overlap) // (tile_size - overlap))
+        n_tiles_w = max(1, (img_width - overlap) // (tile_size - overlap))
+        
+        self.logger.info(f"Processing image of size {img_height}x{img_width} using {n_tiles_h}x{n_tiles_w} tiles")
+        
+        # Initialize result containers
+        all_ship_regions = []
+        tile_metadata = []
+        
+        # Process each tile
+        for i in range(n_tiles_h):
+            for j in range(n_tiles_w):
+                # Calculate tile boundaries with overlap
+                start_h = i * (tile_size - overlap)
+                end_h = min(start_h + tile_size, img_height)
+                start_w = j * (tile_size - overlap)
+                end_w = min(start_w + tile_size, img_width)
+                
+                # Adjust start positions to ensure tile size doesn't exceed image boundaries
+                if end_h - start_h < tile_size:
+                    start_h = max(0, end_h - tile_size)
+                if end_w - start_w < tile_size:
+                    start_w = max(0, end_w - tile_size)
+                
+                self.logger.info(f"Processing tile ({i},{j}) at position ({start_h}:{end_h}, {start_w}:{end_w})")
+                
+                # Extract tile data
+                tile_image = full_image[start_h:end_h, start_w:end_w]
+                
+                if signal_data is not None:
+                    tile_signal = signal_data[start_h:end_h, start_w:end_w]
+                else:
+                    tile_signal = None
+                
+                # Create a temporary processor for this tile
+                tile_processor = SARImagePreprocessor(self.logger)
+                
+                # Apply speckle filter if enabled
+                if self.speckle_filter_size > 0:
+                    tile_image = tile_processor.apply_speckle_filter(
+                        tile_image, self.speckle_filter_size)
+                
+                # Detect ships in the tile
+                ship_detector = ShipDetector(tile_image)
+                tile_detection = ship_detector.process_all()
+                
+                # Adjust ship coordinates to global image coordinates
+                for ship in tile_detection['filtered_ships']:
+                    x1, y1, x2, y2 = ship['bbox']
+                    
+                    # Convert to global coordinates
+                    global_x1 = x1 + start_w
+                    global_y1 = y1 + start_h
+                    global_x2 = x2 + start_w
+                    global_y2 = y2 + start_h
+                    
+                    # Create global ship region
+                    global_ship = ship.copy()
+                    global_ship['bbox'] = (global_x1, global_y1, global_x2, global_y2)
+                    global_ship['center'] = (
+                        (global_x1 + global_x2) // 2, 
+                        (global_y1 + global_y2) // 2
+                    )
+                    global_ship['centroid'] = (
+                        (global_y1 + global_y2) // 2,
+                        (global_x1 + global_x2) // 2
+                    )
+                    global_ship['tile_coords'] = (i, j)
+                    global_ship['tile_bounds'] = (start_h, end_h, start_w, end_w)
+                    
+                    # Only keep ships that are not on the overlap border
+                    # (to avoid duplicate detections)
+                    border_margin = overlap // 2
+                    if (i == 0 or y1 >= border_margin) and \
+                       (j == 0 or x1 >= border_margin) and \
+                       (i == n_tiles_h-1 or y2 <= tile_size - border_margin) and \
+                       (j == n_tiles_w-1 or x2 <= tile_size - border_margin):
+                        all_ship_regions.append(global_ship)
+                
+                # Store tile metadata
+                tile_metadata.append({
+                    'tile_id': (i, j),
+                    'bounds': (start_h, end_h, start_w, end_w),
+                    'ships_detected': len(tile_detection['filtered_ships'])
+                })
+                
+                # Free memory
+                del tile_image, ship_detector, tile_detection
+                if tile_signal is not None:
+                    del tile_signal
+                
+                # Force garbage collection to free memory
+                import gc
+                gc.collect()
+        
+        # Remove duplicate ship detections
+        # Two ships are considered duplicates if their IoU > 0.5
+        filtered_ships = []
+        ship_added = [False] * len(all_ship_regions)
+        
+        def calculate_iou(box1, box2):
+            # Calculate Intersection over Union for two bounding boxes
+            x1_1, y1_1, x2_1, y2_1 = box1
+            x1_2, y1_2, x2_2, y2_2 = box2
+            
+            # Calculate intersection area
+            x_left = max(x1_1, x1_2)
+            y_top = max(y1_1, y1_2)
+            x_right = min(x2_1, x2_2)
+            y_bottom = min(y2_1, y2_2)
+            
+            if x_right < x_left or y_bottom < y_top:
+                return 0.0
+                
+            intersection_area = (x_right - x_left) * (y_bottom - y_top)
+            
+            # Calculate union area
+            box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+            box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union_area = box1_area + box2_area - intersection_area
+            
+            return intersection_area / union_area
+        
+        for i in range(len(all_ship_regions)):
+            if ship_added[i]:
+                continue
+                
+            current_ship = all_ship_regions[i]
+            filtered_ships.append(current_ship)
+            ship_added[i] = True
+            
+            # Mark all similar ships as added
+            for j in range(i+1, len(all_ship_regions)):
+                if ship_added[j]:
+                    continue
+                    
+                # Calculate IoU between ships
+                iou = calculate_iou(
+                    current_ship['bbox'],
+                    all_ship_regions[j]['bbox']
+                )
+                
+                if iou > 0.5:  # Threshold for considering as duplicate
+                    ship_added[j] = True
+        
+        self.logger.info(f"Filtered {len(all_ship_regions)} initial detections to {len(filtered_ships)} unique ships")
+        
+        # Extract regions from full image for each ship
+        for ship in filtered_ships:
+            x1, y1, x2, y2 = ship['bbox']
+            ship['region'] = full_image[y1:y2+1, x1:x2+1]
+            ship['mask'] = np.ones((y2-y1+1, x2-x1+1), dtype=bool)
+        
+        # Store detection results
+        self.detection_results = {
+            'filtered_ships': filtered_ships,
+            'ship_regions': filtered_ships,
+            'num_ships': len(filtered_ships),
+            'tile_metadata': tile_metadata
+        }
+        
+        # If signal data is available, analyze micro-motion for each ship
+        if signal_data is not None and pvp_data is not None:
+            # For micro-motion analysis, we need to extract separate signal data
+            # for each ship to reduce memory usage
+            ship_results = []
+            
+            for ship_idx, ship in enumerate(filtered_ships):
+                self.logger.info(f"Analyzing micro-motion for ship {ship_idx+1}/{len(filtered_ships)}")
+                
+                # Extract ship region plus margin for analysis
+                x1, y1, x2, y2 = ship['bbox']
+                
+                # Add margin for better analysis
+                margin = 10
+                x1_margin = max(0, x1 - margin)
+                y1_margin = max(0, y1 - margin)
+                x2_margin = min(img_width - 1, x2 + margin)
+                y2_margin = min(img_height - 1, y2 + margin)
+                
+                # Extract ship signal data
+                ship_signal = signal_data[y1_margin:y2_margin+1, x1_margin:x2_margin+1]
+                
+                # Create subapertures for this ship
+                phase_extractor = PixelPhaseHistoryExtractor(self.logger)
+                subapertures = phase_extractor.create_subapertures(
+                    ship_signal, self.num_subapertures)
+                
+                # Adjust ship coordinates for the extracted region
+                ship_bbox_local = (
+                    x1 - x1_margin,
+                    y1 - y1_margin,
+                    x2 - x1_margin,
+                    y2 - y1_margin
+                )
+                
+                ship_local = {
+                    'bbox': ship_bbox_local,
+                    'mask': ship['mask']
+                }
+                
+                # Extract phase histories
+                ship_phase_data = phase_extractor.extract_ship_phase_histories(ship_local)
+                
+                # Get ship region image for component classification
+                ship_image = subapertures[0, 
+                                        ship_bbox_local[1]:ship_bbox_local[3]+1, 
+                                        ship_bbox_local[0]:ship_bbox_local[2]+1]
+                
+                # Classify ship components if enabled
+                if self.component_analysis:
+                    component_classifier = ShipComponentClassifier(self.logger)
+                    component_map = component_classifier.classify_components(
+                        ship_image, ship['mask'])
+                else:
+                    component_map = np.ones_like(ship['mask'], dtype=int)
+                
+                # Analyze phase histories
+                time_freq_analyzer = TimeFrequencyAnalyzer(self.logger)
+                vibration_analysis = time_freq_analyzer.analyze_ship_region(
+                    ship_phase_data['phase_histories'], 1.0)  # Default sampling freq
+                
+                # Apply physical constraints if not disabled
+                if not self.skip_constraints:
+                    physics_analyzer = PhysicsConstrainedAnalyzer(self.logger)
+                    constrained_freqs, constrained_amps = physics_analyzer.apply_physical_constraints(
+                        component_map,
+                        vibration_analysis['dominant_frequencies'],
+                        vibration_analysis['dominant_amplitudes']
+                    )
+                else:
+                    constrained_freqs = vibration_analysis['dominant_frequencies']
+                    constrained_amps = vibration_analysis['dominant_amplitudes']
+                
+                # Collect results for this ship
+                ship_result = {
+                    'ship_index': ship_idx,
+                    'bbox': ship['bbox'],
+                    'phase_histories': ship_phase_data,
+                    'vibration_analysis': vibration_analysis,
+                    'component_map': component_map,
+                    'constrained_frequencies': constrained_freqs,
+                    'constrained_amplitudes': constrained_amps,
+                    'sampling_freq': 1.0  # Default
+                }
+                
+                ship_results.append(ship_result)
+                
+                # Free memory
+                del ship_signal, subapertures, phase_extractor
+                import gc
+                gc.collect()
+            
+            # Store vibration results
+            self.vibration_results = {
+                'num_ships': len(filtered_ships),
+                'ship_results': ship_results,
+                'sampling_freq': 1.0,  # Default
+                'num_subapertures': self.num_subapertures,
+                'subaperture_timestamps': np.arange(self.num_subapertures),
+                'physical_constraints_applied': not self.skip_constraints,
+                'component_analysis_enabled': self.component_analysis
+            }
+            
+            # Create visualizations
+            self.create_visualizations()
+        
+        # Save results
+        saved_files = self.save_results()
+        
+        return {
+            'status': 'success',
+            'read_results': self.read_results,
+            'detection_results': self.detection_results,
+            'vibration_results': self.vibration_results if signal_data is not None else None,
+            'visualization_results': self.visualization_results,
+            'saved_files': saved_files
+        }
+
+    def pipeline_process(self) -> Dict[str, Any]:
+        """
+        Run the processing pipeline with task parallelism using Dask.
+        This implementation creates a directed acyclic graph (DAG) of computations,
+        allowing for parallel execution of independent tasks.
+        
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing processing results.
+        """
+        if not DASK_AVAILABLE:
+            self.logger.warning("Dask not available, falling back to sequential processing")
+            return self.process()
+            
+        self.logger.info("Starting pipeline processing with Dask task parallelism")
+        
+        # Define task functions for pipeline stages
+        @delayed
+        def read_data_task():
+            """Task for reading SAR data."""
+            self.logger.info("Task: Reading SAR data")
+            return self.read_data()
+        
+        @delayed
+        def detect_ships_task(read_results):
+            """Task for detecting ships."""
+            self.logger.info("Task: Detecting ships")
+            self.read_results = read_results
+            
+            if self.use_manual_selection:
+                return self.manually_select_ships()
+            else:
+                return self.detect_ships()
+        
+        @delayed
+        def analyze_micromotion_task(read_results, detection_results):
+            """Task for analyzing ship micro-motion."""
+            self.logger.info("Task: Analyzing ship micro-motion")
+            self.read_results = read_results
+            self.detection_results = detection_results
+            
+            if read_results['type'] == 'cphd':
+                return self.analyze_ship_micromotion(
+                    read_results['signal_data'], 
+                    read_results['pvp_data'], 
+                    detection_results['filtered_ships'],
+                    self.num_subapertures
+                )
+            else:
+                self.logger.warning("Micro-motion analysis not possible - requires CPHD data")
+                return None
+        
+        @delayed
+        def create_visualizations_task(read_results, detection_results, vibration_results):
+            """Task for creating visualizations."""
+            self.logger.info("Task: Creating visualizations")
+            self.read_results = read_results
+            self.detection_results = detection_results
+            self.vibration_results = vibration_results
+            
+            return self.create_visualizations()
+        
+        @delayed
+        def save_results_task(visualization_results):
+            """Task for saving results."""
+            self.logger.info("Task: Saving results")
+            self.visualization_results = visualization_results
+            
+            return self.save_results()
+        
+        # Set up pipeline DAG
+        # Stage 1: Read data
+        read_stage = read_data_task()
+        
+        # Stage 2: Detect ships
+        detection_stage = detect_ships_task(read_stage)
+        
+        # Stage 3: Analyze micro-motion (if applicable)
+        micromotion_stage = analyze_micromotion_task(read_stage, detection_stage)
+        
+        # Stage 4: Create visualizations
+        visualization_stage = create_visualizations_task(read_stage, detection_stage, micromotion_stage)
+        
+        # Stage 5: Save results
+        save_stage = save_results_task(visualization_stage)
+        
+        # Execute the pipeline with progress reporting
+        self.logger.info("Executing pipeline...")
+        
+        # Monitor computation progress
+        try:
+            from dask.diagnostics import ProgressBar
+            with ProgressBar():
+                saved_files = save_stage.compute()
+        except ImportError:
+            saved_files = save_stage.compute()
+        
+        self.logger.info("Pipeline processing complete")
         
         return {
             'status': 'success',

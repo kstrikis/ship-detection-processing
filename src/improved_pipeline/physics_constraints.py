@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Union, Tuple
 
 # Import utility functions
-from utils import (
+from .utils import (
     setup_logging, save_results, load_step_output, check_gpu_availability,
     scale_for_display
 )

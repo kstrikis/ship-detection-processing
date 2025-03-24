@@ -1,11 +1,11 @@
-# Dependencies for Ship Detection Processing
-numpy>=1.20.0
-scipy>=1.7.0
-matplotlib>=3.4.0
-sarpy>=1.4.0
-psutil>=5.9.0
-dask>=2023.3.0
-cupy-cuda11x>=12.0.0  # Optional: For GPU acceleration, use appropriate version for your CUDA
-PyWavelets>=1.4.1     # For wavelet transforms
-opencv-python>=4.7.0  # For additional image processing
-tqdm>=4.65.0          # For progress bars
+# Dependencies for Ship Detection Processing (Updated March 2025)
+numpy>=2.2.4           # Latest stable (source 11), supports Python 3.10-3.13
+scipy>=1.15.0          # Latest SciPy with NumPy 2.x support (sources 5,7)
+matplotlib>=3.10.1     # Latest Matplotlib (sources 1,12)
+sarpy>=1.3.60           # Maintained version (no newer info found)
+psutil>=5.9.0          # Compatible with Python 3.10+ (source 4 example)
+dask>=2025.3.0         # Current parallel processing toolkit
+# cupy-cuda12x>=13.0.0   # Updated CUDA 12.x support (source 6 GPU recommendations)
+PyWavelets>=1.5.0      # Updated wavelet transforms
+opencv-python>=4.9.0   # Current OpenCV with NumPy 2.x compatibility
+tqdm>=4.66.0           # Latest progress bar library

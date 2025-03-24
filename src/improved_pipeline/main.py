@@ -21,17 +21,17 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
 
 # Import pipeline stages
-from preprocessor import preprocess_sar_data
-from ship_detector import detect_ships
-from manual_selection import manually_select_ships
-from phase_extractor import extract_phase_history
-from time_frequency_analyzer import analyze_time_frequency
-from component_classifier import classify_components
-from physics_constraints import apply_physics_constraints
-from visualizer import create_visualizations
+from .preprocessor import preprocess_sar_data
+from .ship_detector import detect_ships
+from .manual_selection import manually_select_ships
+from .phase_extractor import extract_phase_history
+from .time_frequency_analyzer import analyze_time_frequency
+from .component_classifier import classify_components
+from .physics_constraints import apply_physics_constraints
+from .visualizer import create_visualizations
 
 # Import utilities
-from utils import setup_logging, save_results, load_step_output
+from .utils import setup_logging, save_results, load_step_output
 
 
 def parse_arguments():
