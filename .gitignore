@@ -10,3 +10,4 @@ wheels/
 .venv
 
 sample_data/**
+results/**

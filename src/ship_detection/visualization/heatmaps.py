@@ -134,9 +134,9 @@ class VibrationHeatmapVisualizer:
         freq_bins = int((max_freq - min_freq) / freq_step) + 1
         frequencies = np.linspace(min_freq, max_freq, freq_bins)
         
-        # Initialize heatmap
-        frequency_heatmap = np.zeros((rows, cols))
-        power_heatmap = np.zeros((rows, cols))
+        # Initialize heatmap with NaN values (for non-ship pixels)
+        frequency_heatmap = np.full((rows, cols), np.nan)
+        power_heatmap = np.full((rows, cols), np.nan)
         
         # Extract time series data from vibration data
         times = self.vibration_data['vibration_params']['times']
@@ -146,18 +146,30 @@ class VibrationHeatmapVisualizer:
         # Calculate sampling frequency
         sampling_freq = 1 / (times[1] - times[0])
         
-        # Apply sliding window FFT across the image
+        # Find ship pixel locations
+        ship_pixels = np.where(mask)
+        
+        # If there are no ship pixels, return empty heatmap
+        if len(ship_pixels[0]) == 0:
+            logger.warning(f"No ship pixels found in region {ship_index}")
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+            ax1.imshow(region, cmap='gray')
+            ax1.set_title(f'Ship {ship_index}')
+            ax2.set_title(f'No ship pixels found')
+            plt.tight_layout()
+            return fig, frequency_heatmap
+            
+        # Apply sliding window FFT only to windows containing ship pixels
         for i in range(0, rows - window_size + 1, window_size // 2):
             for j in range(0, cols - window_size + 1, window_size // 2):
-                # Check if the window contains ship pixels
+                # Get window mask and check if it contains ship pixels
                 window_mask = mask[i:i+window_size, j:j+window_size]
-                if np.sum(window_mask) > 0:
-                    # Extract window
-                    window = region[i:i+window_size, j:j+window_size]
-                    
-                    # Create time series (simplified - using global shifts as proxy)
-                    # In a real implementation, this should be customized to the specific window
-                    local_signal = range_shifts + azimuth_shifts  # Simplified
+                ship_pixel_count = np.sum(window_mask)
+                
+                # Only process windows with ship pixels
+                if ship_pixel_count > 0:
+                    # Create time series (simplified - using global shifts)
+                    local_signal = range_shifts + azimuth_shifts
                     
                     # Apply Hanning window
                     windowed_signal = local_signal * np.hanning(len(local_signal))
@@ -178,12 +190,12 @@ class VibrationHeatmapVisualizer:
                         dominant_freq = valid_freqs[max_idx]
                         power = valid_fft[max_idx]
                         
-                        # Assign to all pixels in the window
-                        frequency_heatmap[i:i+window_size, j:j+window_size] = dominant_freq
-                        power_heatmap[i:i+window_size, j:j+window_size] = power
-        
-        # Set non-ship pixels to NaN for visualization
-        frequency_heatmap[~mask] = np.nan
+                        # ONLY assign to ship pixels in the window
+                        for wi in range(window_size):
+                            for wj in range(window_size):
+                                if i+wi < rows and j+wj < cols and window_mask[wi, wj]:
+                                    frequency_heatmap[i+wi, j+wj] = dominant_freq
+                                    power_heatmap[i+wi, j+wj] = power
         
         # Create figure
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
@@ -200,8 +212,9 @@ class VibrationHeatmapVisualizer:
         ax1.set_xlabel('Column')
         ax1.set_ylabel('Row')
         
-        # Plot frequency heatmap
-        im = ax2.imshow(frequency_heatmap, cmap=cmap, vmin=min_freq, vmax=max_freq)
+        # Plot frequency heatmap with a custom masked array for clearer visualization
+        masked_heatmap = np.ma.array(frequency_heatmap, mask=np.isnan(frequency_heatmap))
+        im = ax2.imshow(masked_heatmap, cmap=cmap, vmin=min_freq, vmax=max_freq)
         ax2.set_title(f'Vibration Frequency Heatmap ({min_freq}-{max_freq} Hz)')
         ax2.set_xlabel('Column')
         ax2.set_ylabel('Row')
@@ -241,26 +254,40 @@ class VibrationHeatmapVisualizer:
         region = ship['region']
         mask = ship['mask']
         
-        # Find pixels belonging to the ship
-        ship_pixels = np.where(mask)
+        # Find intensity values in the ship region
+        if np.iscomplexobj(region):
+            intensity = np.abs(region)
+        else:
+            intensity = region
+            
+        # Create a display image for visualization
+        disp_region = np.log10(intensity + 1)
+        disp_region = (disp_region - np.min(disp_region)) / (np.max(disp_region) - np.min(disp_region))
+        
+        # Identify high-intensity pixels (likely the actual ship)
+        # Use a threshold at 70% of the maximum intensity after applying the mask
+        masked_intensity = intensity.copy()
+        masked_intensity[~mask] = 0
+        if np.max(masked_intensity) > 0:
+            threshold = 0.7 * np.max(masked_intensity)
+            high_intensity_mask = masked_intensity > threshold
+        else:
+            # Fallback if no clear high intensity pixels
+            high_intensity_mask = mask
+        
+        # Find ship pixels using the high intensity mask for better ship detection
+        ship_pixels = np.where(high_intensity_mask)
         
         if len(ship_pixels[0]) == 0:
-            raise ValueError("No ship pixels found in the mask.")
-            
-        # Sample points
-        num_points = min(num_points, len(ship_pixels[0]))
-        indices = np.linspace(0, len(ship_pixels[0])-1, num_points, dtype=int)
+            # Fallback to original mask if no high intensity pixels found
+            ship_pixels = np.where(mask)
+            if len(ship_pixels[0]) == 0:
+                raise ValueError("No ship pixels found in the mask.")
         
         # Create figure
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
         
         # Plot ship region
-        if np.iscomplexobj(region):
-            disp_region = np.log10(np.abs(region) + 1)
-        else:
-            disp_region = region
-        disp_region = (disp_region - np.min(disp_region)) / (np.max(disp_region) - np.min(disp_region))
-        
         ax1.imshow(disp_region, cmap='gray')
         ax1.set_title(f'Ship {ship_index} with Measurement Points')
         
@@ -278,8 +305,36 @@ class VibrationHeatmapVisualizer:
         # Generate colors for points
         colors = plt.cm.tab10(np.linspace(0, 1, num_points))
         
-        # Plot frequency spectra
-        for i, idx in enumerate(indices):
+        # If we have enough pixels, select points in a more structured way
+        if len(ship_pixels[0]) >= num_points:
+            # Find the centroid of the high intensity region
+            centroid_y = np.mean(ship_pixels[0])
+            centroid_x = np.mean(ship_pixels[1])
+            
+            # Calculate distances from centroid
+            distances = np.sqrt((ship_pixels[0] - centroid_y)**2 + (ship_pixels[1] - centroid_x)**2)
+            
+            # Select points: 1 at center, others distributed from center to edge
+            sorted_indices = np.argsort(distances)
+            # Take the center point, then evenly spaced points outward
+            selected_indices = [sorted_indices[0]]  # Center point
+            if num_points > 1:
+                # Add points from different parts of the ship
+                edge_indices = sorted_indices[1:]
+                step = len(edge_indices) // (num_points - 1)
+                if step == 0:
+                    step = 1
+                selected_indices.extend(edge_indices[::step][:num_points-1])
+            
+            # Ensure we have the right number of points
+            selected_indices = selected_indices[:num_points]
+        else:
+            # If we don't have enough pixels, use all available
+            selected_indices = list(range(len(ship_pixels[0])))
+            num_points = len(selected_indices)
+        
+        # Plot frequency spectra for selected points
+        for i, idx in enumerate(selected_indices):
             row, col = ship_pixels[0][idx], ship_pixels[1][idx]
             
             # Plot the point on the image
@@ -290,6 +345,9 @@ class VibrationHeatmapVisualizer:
             # Here we're using the global spectrum as a demonstration
             ax2.plot(plot_freqs, plot_range, '-', color=colors[i], label=f'Point {i+1} (Range)')
             ax2.plot(plot_freqs, plot_azimuth, '--', color=colors[i], alpha=0.5, label=f'Point {i+1} (Azimuth)')
+        
+        # Highlight the high intensity area for visualization
+        ax1.contour(high_intensity_mask, levels=[0.5], colors='red', alpha=0.7)
         
         ax2.set_title('Vibration Frequency Spectra')
         ax2.set_xlabel('Frequency (Hz)')
